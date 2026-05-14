@@ -26,20 +26,48 @@ def get_model(model_name, device='cpu'):
             raise ValueError(f"Unknown RobustBench model {model_name}")
     elif model_name == 'patchguard':
         import sys
-        patchguard_dir = os.path.join(os.path.dirname(__file__), 'PatchGuard')
+        # Tìm thư mục PatchGuard linh hoạt hơn
+        possible_paths = [
+            os.path.join(os.path.dirname(__file__), 'PatchGuard'),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'PatchGuard'),
+            '/content/PatchGuard'
+        ]
+        patchguard_dir = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                patchguard_dir = p
+                break
+        
+        if patchguard_dir is None:
+            patchguard_dir = os.path.join(os.path.dirname(__file__), 'PatchGuard')
+
         if patchguard_dir not in sys.path:
             sys.path.insert(0, patchguard_dir)
+        import importlib.util
         try:
-            import nets.bagnet
-            from utils.defense_utils import masking_defense
-        except ImportError:
-            raise ValueError("PatchGuard repo not found or missing dependencies. Please clone it.")
+            # Load nets.bagnet manually to avoid naming conflicts with local utils.py
+            bagnet_py = os.path.join(patchguard_dir, 'nets', 'bagnet.py')
+            spec_bagnet = importlib.util.spec_from_file_location("pg_nets_bagnet", bagnet_py)
+            pg_nets_bagnet = importlib.util.module_from_spec(spec_bagnet)
+            sys.modules["nets"] = pg_nets_bagnet # Optional, helps with internal refs
+            sys.modules["nets.bagnet"] = pg_nets_bagnet
+            spec_bagnet.loader.exec_module(pg_nets_bagnet)
+            nets_bagnet = pg_nets_bagnet
+            
+            # Load utils.defense_utils manually
+            defense_py = os.path.join(patchguard_dir, 'utils', 'defense_utils.py')
+            spec_defense = importlib.util.spec_from_file_location("pg_utils_defense", defense_py)
+            pg_utils_defense = importlib.util.module_from_spec(spec_defense)
+            spec_defense.loader.exec_module(pg_utils_defense)
+            masking_defense = pg_utils_defense.masking_defense
+        except Exception as e:
+            raise ValueError(f"PatchGuard repo loading failed: {e}. Please ensure you cloned it correctly.")
         
         checkpoint_path = os.path.join(patchguard_dir, 'checkpoints', 'bagnet17_net.pth')
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"PatchGuard checkpoint missing at {checkpoint_path}. Please download 'bagnet17_net.pth' from their Google Drive and place it there.")
             
-        base_model = nets.bagnet.bagnet17(pretrained=True, clip_range=None, aggregation='none')
+        base_model = nets_bagnet.bagnet17(pretrained=True, clip_range=None, aggregation='none')
         base_model = torch.nn.DataParallel(base_model)
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         base_model.load_state_dict(checkpoint['state_dict'])
@@ -89,6 +117,18 @@ def load_image(image_path, device='cpu'):
     tensor_img = transform(image).to(device)
     return tensor_img, image
 
+class ImageNetFolder(torchvision.datasets.ImageFolder):
+    """
+    Custom ImageFolder that uses folder names (0, 1, ..., 999) as the actual integer labels,
+    avoiding the alphabetical sorting mismatch.
+    """
+    def find_classes(self, directory):
+        classes = [d.name for d in os.scandir(directory) if d.is_dir()]
+        classes.sort(key=lambda x: int(x) if x.isdigit() else x)
+        class_to_idx = {cls_name: int(cls_name) if cls_name.isdigit() else i 
+                        for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
+
 def load_imagenet_subset(data_dir, num_images=1000):
     """
     Loads a subset of ImageNet validation images from a directory.
@@ -100,15 +140,14 @@ def load_imagenet_subset(data_dir, num_images=1000):
         transforms.ToTensor()
     ])
     
-    # Try to use torchvision ImageFolder
     try:
-        dataset = torchvision.datasets.ImageFolder(root=data_dir, transform=transform)
+        dataset = ImageNetFolder(root=data_dir, transform=transform)
         # Random subset
         indices = np.random.choice(len(dataset), min(num_images, len(dataset)), replace=False)
         subset = torch.utils.data.Subset(dataset, indices)
         return subset
     except Exception as e:
-        print(f"Failed to load ImageFolder: {e}")
+        print(f"Failed to load ImageNetFolder: {e}")
         return None
 
 class NormalizedModel(torch.nn.Module):

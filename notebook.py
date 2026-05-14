@@ -3,7 +3,20 @@
 # ## 0.1 Cài đặt dependencies
 # Chạy lệnh sau để cài đặt toàn bộ thư viện cần thiết:
 # pip install -r requirements.txt
-# Các thư viện chính bao gồm: torch, torchvision, numpy, Pillow, scipy, robustbench, datasets, autoattack, tensorflow, opencv-python.
+# Các thư viện chính bao gồm: torch, torchvision, numpy, Pillow, scipy, robustbench, datasets, autoattack, tensorflow, opencv-python, huggingface_hub.
+
+# %% [markdown]
+# ## 0.1.1 Đăng nhập Hugging Face
+# Vì tập dữ liệu ImageNet-1K chính thức (`ILSVRC/imagenet-1k`) là tập dữ liệu đóng (gated), bạn cần:
+# 1. Chấp nhận điều khoản tại: https://huggingface.co/datasets/ILSVRC/imagenet-1k
+# 2. Chạy ô dưới đây để đăng nhập bằng Access Token (lấy tại https://huggingface.co/settings/tokens)
+
+# %%
+try:
+    from huggingface_hub import notebook_login
+    notebook_login()
+except ImportError:
+    print("Vui lòng cài đặt huggingface_hub: pip install huggingface_hub")
 
 # %%
 import torch
@@ -61,9 +74,9 @@ def download_imagenet_subset(output_dir='imagenet_val_1000', num_images=1000,
         transforms.ToTensor()
     ])
 
-    print(f"Đang tải ảnh từ Hugging Face (mrm8488/ImageNet1K-val) và lọc qua {len(models_to_check)} models...")
+    print(f"Đang tải ảnh từ Hugging Face (ILSVRC/imagenet-1k) và lọc qua {len(models_to_check)} models...")
     try:
-        ds = load_dataset('mrm8488/ImageNet1K-val', split='train', streaming=True, trust_remote_code=True)
+        ds = load_dataset('ILSVRC/imagenet-1k', split='validation', streaming=True, trust_remote_code=True)
         os.makedirs(output_dir, exist_ok=True)
         
         count = 0
@@ -103,8 +116,24 @@ def download_imagenet_subset(output_dir='imagenet_val_1000', num_images=1000,
         return True
     except Exception as e:
         print(f"Lỗi khi tải dataset: {e}")
+        print("\nLƯU Ý: ILSVRC/imagenet-1k là tập dữ liệu yêu cầu quyền truy cập.")
+        print("Vui lòng đảm bảo bạn đã:")
+        print("1. Ấn 'Agree and access repository' tại https://huggingface.co/datasets/ILSVRC/imagenet-1k")
+        print("2. Chạy lệnh 'huggingface-cli login' trong terminal và nhập Access Token.")
         return False
 
+
+class ImageNetFolder(torchvision.datasets.ImageFolder):
+    """
+    Custom ImageFolder that uses folder names (0, 1, ..., 999) as the actual integer labels,
+    avoiding the alphabetical sorting mismatch.
+    """
+    def find_classes(self, directory):
+        classes = [d.name for d in os.scandir(directory) if d.is_dir()]
+        classes.sort(key=lambda x: int(x) if x.isdigit() else x)
+        class_to_idx = {cls_name: int(cls_name) if cls_name.isdigit() else i 
+                        for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
 
 def load_imagenet_subset(data_dir, num_images=1000):
     transform = transforms.Compose([
@@ -113,13 +142,13 @@ def load_imagenet_subset(data_dir, num_images=1000):
         transforms.ToTensor()
     ])
     try:
-        dataset = torchvision.datasets.ImageFolder(root=data_dir, transform=transform)
+        dataset = ImageNetFolder(root=data_dir, transform=transform)
         # Lấy random subset
         indices = np.random.choice(len(dataset), min(num_images, len(dataset)), replace=False)
         subset = torch.utils.data.Subset(dataset, indices)
         return subset
     except Exception as e:
-        print(f"Failed to load ImageFolder: {e}")
+        print(f"Failed to load ImageNetFolder: {e}")
         return None
 
 # %% [markdown]
@@ -165,20 +194,48 @@ def get_model(model_name, device='cpu'):
             raise ValueError(f"Unknown RobustBench model {model_name}")
     elif model_name == 'patchguard':
         import sys
-        patchguard_dir = os.path.join(os.getcwd(), 'PatchGuard')
+        # Tìm thư mục PatchGuard linh hoạt hơn (hỗ trợ cả Colab và chạy local)
+        possible_paths = [
+            os.path.join(os.getcwd(), 'PatchGuard'),
+            os.path.join(os.path.dirname(os.getcwd()), 'PatchGuard'),
+            '/content/PatchGuard'
+        ]
+        patchguard_dir = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                patchguard_dir = p
+                break
+        
+        if patchguard_dir is None:
+            patchguard_dir = os.path.join(os.getcwd(), 'PatchGuard') # Mặc định nếu không thấy
+
         if patchguard_dir not in sys.path:
             sys.path.insert(0, patchguard_dir)
+        import importlib.util
         try:
-            import nets.bagnet
-            from utils.defense_utils import masking_defense
-        except ImportError:
-            raise ValueError("PatchGuard repo not found. Please clone it.")
+            # Load nets.bagnet manually to avoid naming conflicts with local utils.py
+            bagnet_py = os.path.join(patchguard_dir, 'nets', 'bagnet.py')
+            spec_bagnet = importlib.util.spec_from_file_location("pg_nets_bagnet", bagnet_py)
+            pg_nets_bagnet = importlib.util.module_from_spec(spec_bagnet)
+            sys.modules["nets"] = pg_nets_bagnet 
+            sys.modules["nets.bagnet"] = pg_nets_bagnet
+            spec_bagnet.loader.exec_module(pg_nets_bagnet)
+            nets_bagnet = pg_nets_bagnet
+            
+            # Load utils.defense_utils manually
+            defense_py = os.path.join(patchguard_dir, 'utils', 'defense_utils.py')
+            spec_defense = importlib.util.spec_from_file_location("pg_utils_defense", defense_py)
+            pg_utils_defense = importlib.util.module_from_spec(spec_defense)
+            spec_defense.loader.exec_module(pg_utils_defense)
+            masking_defense = pg_utils_defense.masking_defense
+        except Exception as e:
+            raise ValueError(f"PatchGuard repo loading failed: {e}. Please ensure you cloned it correctly.")
         
         checkpoint_path = os.path.join(patchguard_dir, 'checkpoints', 'bagnet17_net.pth')
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"PatchGuard checkpoint missing at {checkpoint_path}. Please download it.")
             
-        base_model = nets.bagnet.bagnet17(pretrained=True, clip_range=None, aggregation='none')
+        base_model = nets_bagnet.bagnet17(pretrained=True, clip_range=None, aggregation='none')
         base_model = torch.nn.DataParallel(base_model)
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         base_model.load_state_dict(checkpoint['state_dict'])
